@@ -143,6 +143,7 @@ class MOFA(PyroModule):
         if self.subsample_ix is None:
             sample_plate = pyro.plate("sample", self.num_samples, subsample_size=self.batch_size)
         else:
+            print(len(self.subsample_ix))
             sample_plate = pyro.plate("sample", self.num_samples, subsample=self.subsample_ix)
         # the plates get assigned a dim, depending on when in the plate hierarchy they are used. Unfortunately we want to use
         #   feature plates once outside and once inside other plate (sample resp. latent_factor plates, see below)
