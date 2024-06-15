@@ -18,6 +18,7 @@ from scipy.stats import spearmanr, pearsonr
 import scanpy as sc
 import anndata as ad
 import pandas as pd
+import os
 device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
 
 # simulate data
@@ -210,8 +211,9 @@ class FA(PyroModule):
         return train_loss#, map_estimates
 
 if __name__ == "__main__":
-    Cite_GEX = sc.read_h5ad("/mnt/storage/anna/data/Cite_GEX_preprocessed.h5ad")
-    Cite_ADT = sc.read_h5ad("/mnt/storage/anna/data/Cite_ADT_preprocessed.h5ad")
+    dir = "/scratch/deeplife/projekt/data/" if os.path.exists("/scratch/deeplife/projekt") else "/mnt/storage/anna/data/"
+    Cite_GEX = sc.read_h5ad(dir + "Cite_GEX_preprocessed.h5ad")
+    Cite_ADT = sc.read_h5ad(dir + "Cite_ADT_preprocessed.h5ad")
     Y = ad.concat([Cite_ADT, Cite_GEX], axis = 1, merge="same")
     Y = torch.tensor(Y.X.A).to(device)
     n_factors = 10

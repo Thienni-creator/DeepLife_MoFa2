@@ -19,6 +19,7 @@ def to_device(t): return torch.tensor(t).to(device)
 class MOFAMatrices:
     Z: torch.Tensor
     Ws: dict[str, torch.Tensor]
+    s: dict[str, torch.Tensor]
 
 def to_torch_sparse(matrix: scipy.sparse.csr_matrix, device: torch.device = torch.device("cpu")) -> torch.Tensor:
     return torch.sparse_csr_tensor(matrix.indptr, matrix.indices, matrix.data, size=matrix.shape, device=device)
@@ -77,6 +78,14 @@ def replace_nans(x: ty.Union[torch.Tensor, scipy.sparse.csr_matrix], nan: float)
     else:
         return torch.nan_to_num(x, nan=nan)
 
+def sparse_std(Y):
+    # means = Y.mean(axis=0)
+    # data_count = (Y != 0).sum(axis=0)
+    return np.array([
+        Y[i, :].A.std()
+        for i in range(Y.shape[1])
+    ])
+
 class MOFA(PyroModule):
     def __init__(self, Ys: dict[str, torch.Tensor], K, batch_size=128, Guide: type[autoguide.AutoGuide] = autoguide.AutoNormal):
         """
@@ -87,10 +96,13 @@ class MOFA(PyroModule):
         super().__init__()
         pyro.clear_param_store()
 
-        self.K = K  # number of factors 
-        self.empirical_means = { m: torch.tensor(Y.mean(axis=0)) if isinstance(Y, scipy.sparse.csr_matrix) else Y.mean(dim=0)
+        Ys = { m: Y.log1p()
+               for m, Y in Ys.items() }
+
+        self.K = K  # number of factors
+        self.empirical_means = { m: torch.tensor(Y.mean(axis=0), device=device) if isinstance(Y, scipy.sparse.csr_matrix) else torch.tensor(Y.mean(dim=0), device=device)
                                  for m, Y in Ys.items() }
-        self.empirical_stds = { m: 1 if isinstance(Y, scipy.sparse.csr_matrix) else torch.clamp(torch.std(Y, dim=0),1)
+        self.empirical_stds = { m: torch.clamp(torch.tensor(sparse_std(Y), device=device) if isinstance(Y, scipy.sparse.csr_matrix) else torch.std(Y, dim=0),min=0.1)
                                 for m, Y in Ys.items() }
 
         self.obs_masks = { m: get_mask(Y)
@@ -145,15 +157,17 @@ class MOFA(PyroModule):
         for m, feature_plate in get_feature_plates(-2).items():
             # the actual dimensions obtained by plates are read from right to left/inner to outer
             with self.latent_factor_plate:
+                theta = pyro.sample(f"theta_{m}", pyro.distributions.Beta(to_device(1.), 1.))
                 # Sample alphas (controls narrowness of weight distr for each factor) from a Gamma distribution
                 # Gamma parametrization k, theta or eq. a, b; (where k=a and theta=1/b) 
                 # (if k integer) Gamma = the sum of k independent exponentially distributed random variables, each of 
                 # which has a mean of theta
-                alpha = pyro.sample(f"alpha_{m}", pyro.distributions.Gamma(to_device(1.), 1.))
+                alpha = pyro.sample(f"alpha_{m}", pyro.distributions.Gamma(to_device(10.), 10.))
                 
                 with feature_plate:
                     # sample weight matrix with Normal prior distribution with alpha narrowness
-                    Ws[m] = pyro.sample(f"W_{m}", pyro.distributions.Normal(to_device(0.), 1. / alpha))                
+                    Ws[m] = pyro.sample(f"W_{m}", pyro.distributions.Normal(to_device(0.), 1. / alpha))
+                    Ws[m] *= pyro.sample(f"s_{m}", pyro.distributions.Bernoulli(theta))
                 
         # create Z matrix
         # (the actual dimensions are read from right to left/inner to outer)
@@ -169,7 +183,10 @@ class MOFA(PyroModule):
             with feature_plate:
                 # sample scale (tau) parameter for each feature-~~sample~~ pair with LogNormal prior (has to be positive)
                 # add 0.001 to avoid NaNs when Normal(σ = 0)
-                scale_tau = 0.001 + pyro.sample(f"scale_{m}", pyro.distributions.LogNormal(to_device(0.), 1.))
+                #scale_tau = 0.001 + pyro.sample(f"scale_{m}", pyro.distributions.LogNormal(to_device(0.), 1.))
+                precision = pyro.sample(f"precision_{m}", pyro.distributions.Gamma(to_device(20.), to_device(20.)))
+                scale = 0.01 + pyro.sample(f"scale_{m}", pyro.distributions.LogNormal(to_device(0.), 1./precision))
+                #scale=to_device(1.0)
                 
                 with sample_plate as sub_indices:
                     # masking the NA values such that they are not considered in the distributions
@@ -180,13 +197,14 @@ class MOFA(PyroModule):
                         obs_mask = obs_mask[sub_indices, :]
 
                     Y, Y_hat = self.get_sample_batch(m, sub_indices), Y_hats[m]
+                    Y = (Y - self.empirical_means[m]) / self.empirical_stds[m]
 
                     with pyro.poutine.mask(mask=obs_mask): #type: ignore
                         # # sample scale parameter for each feature-sample pair with LogNormal prior (has to be positive)
                         # scale = pyro.sample(f"scale_{m}", pyro.distributions.LogNormal(to_device(0., 1.)))
                         
                         # compare sampled estimation to the true observation Y
-                        pyro.sample(f"obs_{m}", pyro.distributions.Normal(Y_hat, scale_tau), obs=Y)
+                        pyro.sample(f"obs_{m}", pyro.distributions.Normal(Y_hat, scale), obs=Y)
                         # pyro.sample(f"obs_{m}", pyro.distributions.Normal(Y_hat, self.empirical_stds[m]), obs=Y)
                         # NB mean = r * (1-p) / p
                         #    vari = r * (1-p) / p^2
@@ -195,10 +213,10 @@ class MOFA(PyroModule):
                         # print(r[:5, :5], p[:5, :5], Y[:5, :5])
                         # pyro.sample(f"obs_{m}", pyro.distributions.NegativeBinomial(r, p), obs=Y)
 
-    def train(self, lr=0.002, num_iterations = 4000):
+    def train(self, lr=0.02, num_iterations = 4000):
         # set training parameters
         optimizer = pyro.optim.Adam({"lr": lr})
-        elbo = pyro.infer.Trace_ELBO()
+        elbo = pyro.infer.TraceEnum_ELBO()
         guide = self.Guide(self.model)
         t0 = time.time()
         # guide = autoguide.AutoDelta(self.model)
@@ -234,7 +252,9 @@ class MOFA(PyroModule):
         # set training parameters
         optimizer = pyro.optim.Adam({"lr": lr})
         elbo = pyro.infer.Trace_ELBO()
-        guide = self.Guide(self.model)
+        guide = autoguide.AutoGuideList(self.model).to(device)
+        guide.append(autoguide.AutoNormal(pyro.poutine.block(self.model, hide=['s_rna', "s_protein"])))
+        guide.append(autoguide.AutoDiscreteParallel(pyro.poutine.block(self.model, expose=['s_rna', "s_protein"])))
         t0 = time.time()
         svi = pyro.infer.SVI(
             model = self.model,
@@ -265,11 +285,15 @@ class MOFA(PyroModule):
         return train_loss, map_estimates, guide
     
     def get_matrices(self, device:torch.device = torch.device("cpu"))  -> MOFAMatrices:
-        guidename = "AutoNormal.locs" if self.Guide == autoguide.AutoNormal else "AutoDelta"
+        print(pyro.get_param_store().keys())
+        guidename = "AutoGuideList." if self.Guide == autoguide.AutoNormal else "AutoDelta"
         return MOFAMatrices(
-            Z=pyro.get_param_store().get_param(guidename+".Z").detach().to(device),
-            Ws={ m: pyro.get_param_store().get_param(f'{guidename}.W_{m}').detach().to(device)
-                 for m in self.Ys.keys() }
+            Z=pyro.get_param_store().get_param(guidename+"0.locs.Z").detach().to(device),
+            Ws={ m: pyro.get_param_store().get_param(f'{guidename}0.locs.W_{m}').detach().to(device)
+                 for m in self.Ys.keys() },
+            s={ m: pyro.get_param_store().get_param(f'{guidename}1.s_{m}_probs').detach().to(device)
+                for m in self.Ys.keys()
+                if f'{guidename}1.s_{m}_probs' in pyro.get_param_store().keys() },
         )
     
     def save_h5(self, obs_index, modality_dset: dict[str, ty.Any], file: str, compression = 1):

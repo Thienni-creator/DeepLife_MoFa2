@@ -17,12 +17,22 @@ from torch.distributions.transforms import SoftmaxTransform
 from scipy.stats import spearmanr, pearsonr
 import scanpy as sc
 import anndata as ad
-import pandas as pd 
+import pandas as pd
+import scipy.sparse
+import os, time, math
 device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
 
 
 ## set modelname for saving
 modelname = "FA_model_sharedWeights_ARD_10factors"
+if os.path.exists("/scratch/deeplife/projekt/data/neurips2021.h5ad"):
+    data_dir = "/scratch/deeplife/projekt/data/"
+    model_dir = "/scratch/deeplife/projekt/models/"
+else:
+    data_dir = "/mnt/storage/anna/data/"
+    model_dir = "/mnt/storage/anna/"
+
+print(f"{data_dir=}")
 
 # simulate data
 n_obs = 100
@@ -62,9 +72,12 @@ torch.set_default_device(device)
 # Y = torch.cat((Y1.T, Y2.T)).T
 # Y.to(device)
 
+def to_torch_sparse(matrix: scipy.sparse.csr_matrix, device: torch.device = torch.device("cpu")) -> torch.Tensor:
+    return torch.sparse_csr_tensor(matrix.indptr, matrix.indices, matrix.data, size=matrix.shape, device=device)
+def to_device(t): return torch.tensor(t).to(device)
 
 class FA(PyroModule):
-    def __init__(self, dat, n_features1, n_features2, K):
+    def __init__(self, dat, n_features1, n_features2, K, batch_size = 1024):
         """
         Args:
             Y: Tensor (Samples x Features)
@@ -78,6 +91,7 @@ class FA(PyroModule):
         self.Y2 = dat[:,n_features1:]
         self.Y = dat
         self.K = K
+        self.batch_size = batch_size
         
 
         ### reorder Y1 and Y2 such that shared genes/prots are at the end
@@ -95,8 +109,8 @@ class FA(PyroModule):
         Y2_mask[Y2_idx_shared] = False
         self.Y2 = self.Y2[:,Y2_mask]
 
-        self.Y1 = torch.tensor(self.Y1.X.A).to(device)## extract only matrices 
-        self.Y2 = torch.tensor(self.Y2.X.A).to(device)
+        # self.Y1 = torch.tensor(self.Y1.X.A).to(device)## extract only matrices 
+        # self.Y2 = torch.tensor(self.Y2.X.A).to(device)
 
         self.num_shared = len(shared_names)
         self.num_features1 = n_features1-self.num_shared
@@ -105,42 +119,42 @@ class FA(PyroModule):
 
         self.num_samples = self.Y1.shape[0]
         #self.batch_size = batch_size
-        self.sample_plate = pyro.plate("sample", self.num_samples)
         self.feature_plate1 = pyro.plate("feature1", self.num_features1)
         self.feature_plate2 = pyro.plate("feature2", self.num_features2)
         self.shared_plate = pyro.plate("shared_features", self.num_shared)
         self.latent_factor_plate = pyro.plate("latent factors", self.K)
         self.to(device)
+        self.subsample_ix = None
+        self.num_samples = self.Y1.shape[0]
 
-    def model(self):
+    def model(self, subsample_ix):
         """
         how to generate a matrix
         """
-        #self.Y1 = batch[:, : self.num_features1]
-        #self.Y2 = batch[:, self.num_features1 :]
         with self.latent_factor_plate:
-            theta1 = pyro.sample("theta1", pyro.distributions.Beta(1., 1.))
-            alpha1 = pyro.sample("alpha1", pyro.distributions.Gamma(torch.tensor(10.), torch.tensor(10.)))
+            theta1 = pyro.sample("theta1", pyro.distributions.Beta(to_device(1.), 1.))
+            alpha1 = pyro.sample("alpha1", pyro.distributions.Gamma(to_device(10.), to_device(10.)))
             with self.feature_plate1:
                 # sample weight matrix with Normal prior distribution
                 #W1_hat = pyro.sample("W1", pyro.distributions.Normal(0., 1.)).to(device)
-                W1_hat = pyro.sample("W1", pyro.distributions.Normal(0., 1./alpha1))*pyro.sample("s1", pyro.distributions.Bernoulli(theta1))
-            theta2 = pyro.sample("theta2", pyro.distributions.Beta(1., 1.))
-            alpha2 = pyro.sample("alpha2", pyro.distributions.Gamma(torch.tensor(10.), torch.tensor(10.)))
+                W1_hat = pyro.sample("W1", pyro.distributions.Normal(to_device(0.), 1./alpha1))*pyro.sample("s1", pyro.distributions.Bernoulli(theta1))
+            theta2 = pyro.sample("theta2", pyro.distributions.Beta(to_device(1.), 1.))
+            alpha2 = pyro.sample("alpha2", pyro.distributions.Gamma(to_device(10.), to_device(10.)))
             with self.feature_plate2:
                 # sample weight matrix with Normal prior distribution
                 #W2_hat = pyro.sample("W2", pyro.distributions.Normal(0., 1.)).to(device)              
-                W2_hat = pyro.sample("W2",pyro.distributions.Normal(0., 1./alpha2))*pyro.sample("s2",pyro.distributions.Bernoulli(theta2))
-            theta_shared = pyro.sample("theta_shared", pyro.distributions.Beta(1., 1.))
-            alpha_shared = pyro.sample("alpha_shared", pyro.distributions.Gamma(torch.tensor(10.), torch.tensor(10.)))
+                W2_hat = pyro.sample("W2",pyro.distributions.Normal(to_device(0.), 1./alpha2))*pyro.sample("s2",pyro.distributions.Bernoulli(theta2))
+            theta_shared = pyro.sample("theta_shared", pyro.distributions.Beta(to_device(1.), 1.))
+            alpha_shared = pyro.sample("alpha_shared", pyro.distributions.Gamma(to_device(10.), to_device(10.)))
             with self.shared_plate:
                 # sample weight matrix with Normal prior distribution
                 #W_shared_hat = pyro.sample("W_shared", pyro.distributions.Normal(0., 1.)).to(device)  
-                W_shared_hat = pyro.sample("W_shared",pyro.distributions.Normal(0., 1./alpha_shared))*pyro.sample("s_shared",pyro.distributions.Bernoulli(theta_shared))
+                W_shared_hat = pyro.sample("W_shared",pyro.distributions.Normal(to_device(0.), 1./alpha_shared))*pyro.sample("s_shared",pyro.distributions.Bernoulli(theta_shared))
                 
-            with self.sample_plate:
+            with pyro.plate("sample", self.num_samples, subsample=subsample_ix, subsample_size=len(subsample_ix)):
                 # sample factor matrix with Normal prior distribution
-                Z = pyro.sample("Z", pyro.distributions.Normal(0., 1.)).to(device)
+                Z = pyro.sample("Z", pyro.distributions.Normal(to_device(0.), 1.))
+                print(Z.shape, len(subsample_ix))
         
         ## concat shared to W1_hat and W2_hat
         W1_hat = torch.cat((W1_hat, W_shared_hat), dim =0)
@@ -148,49 +162,36 @@ class FA(PyroModule):
         # estimate for Y
         Y1_hat = torch.matmul(Z, W1_hat.t())
         Y2_hat = torch.matmul(Z, W2_hat.t())
+        print(f"{Y1_hat.shape=} {Y2_hat.shape=} {len(subsample_ix)}")
         
         with pyro.plate("feature1_", self.Y1.shape[1]): 
             precision1 = pyro.sample("precision1", pyro.distributions.Gamma(torch.tensor(20.), torch.tensor(20.))).to(device)
                     #precision1 = 0.6
                     #print(precision1)
             scale = pyro.sample("scale1", pyro.distributions.LogNormal(0., 1./(precision1))).to(device)
-            with pyro.plate("sample_", self.Y1.shape[0]):
-            # masking the NA values such that they are not considered in the distributions
-                obs_mask = torch.ones_like(self.Y1, dtype=torch.bool)
-                if self.Y1 is not None:
-                    obs_mask = torch.logical_not(torch.isnan(self.Y1))
-                with pyro.poutine.mask(mask=obs_mask):
-                    if self.Y1 is not None:
-                        # a valid value for the NAs has to be defined even though these samples will be ignored later
-                        self.Y1 = torch.nan_to_num(self.Y1, nan=0)
-            
-                    # sample scale parameter for each feature-sample pair with LogNormal prior (has to be positive)
-                    #print(scale)
-                    # compare sampled estimation to the true observation Y
-                    pyro.sample("obs1", pyro.distributions.Normal(Y1_hat, scale), obs=self.Y1).to(device)
-                    #Y1_sampled = pyro.distributions.Normal(Y1_hat, scale)
-                    #pyro.sample("obs1", pyro.distributions.TransformedDistribution(Y1_sampled, SoftmaxTransform()), obs=self.Y1)
+            print(len(subsample_ix))
+            with pyro.plate("sample_", self.num_samples, subsample=subsample_ix):
+                # sample scale parameter for each feature-sample pair with LogNormal prior (has to be positive)
+                #print(scale)
+                # compare sampled estimation to the true observation Y
+                Y = to_torch_sparse(self.Y1.X[subsample_ix], device=device).to_dense()
+                pyro.sample("obs1", pyro.distributions.Normal(Y1_hat, scale), obs=Y).to(device)
+                #Y1_sampled = pyro.distributions.Normal(Y1_hat, scale)
+                #pyro.sample("obs1", pyro.distributions.TransformedDistribution(Y1_sampled, SoftmaxTransform()), obs=self.Y1)
 
 
         with pyro.plate("feature2_", self.Y2.shape[1]):
             precision2 = pyro.sample("precision2", pyro.distributions.Gamma(torch.tensor(20.), torch.tensor(20.))).to(device)
                     #precision2 = 0.6
             scale = pyro.sample("scale2", pyro.distributions.LogNormal(0., 1./(precision2))).to(device)
-            with pyro.plate("sample2_", self.Y2.shape[0]):
-            # masking the NA values such that they are not considered in the distributions
-                obs_mask = torch.ones_like(self.Y2, dtype=torch.bool)
-                if self.Y2 is not None:
-                    obs_mask = torch.logical_not(torch.isnan(self.Y2))
-                with pyro.poutine.mask(mask=obs_mask):
-                    if self.Y2 is not None:
-                        # a valid value for the NAs has to be defined even though these samples will be ignored later
-                        self.Y2 = torch.nan_to_num(self.Y2, nan=0) 
-            
-                    # sample scale parameter for each feature-sample pair with LogNormal prior (has to be positive)
-                    # compare sampled estimation to the true observation Y
-                    pyro.sample("obs2", pyro.distributions.Normal(Y2_hat, scale), obs=self.Y2).to(device)
-                    #Y2_sampled = pyro.distributions.Normal(Y2_hat, scale)
-                    #pyro.sample("obs2", pyro.distributions.TransformedDistribution(Y2_sampled, SoftmaxTransform()), obs=self.Y2)
+            with pyro.plate("sample2_", self.num_samples, subsample=subsample_ix):
+                # masking the NA values such that they are not considered in the distributions
+                # sample scale parameter for each feature-sample pair with LogNormal prior (has to be positive)
+                # compare sampled estimation to the true observation Y
+                Y = to_torch_sparse(self.Y2.X[subsample_ix], device=device).to_dense()
+                pyro.sample("obs2", pyro.distributions.Normal(Y2_hat, scale), obs=Y).to(device)
+                #Y2_sampled = pyro.distributions.Normal(Y2_hat, scale)
+                #pyro.sample("obs2", pyro.distributions.TransformedDistribution(Y2_sampled, SoftmaxTransform()), obs=self.Y2)
 
 
     def train(self):
@@ -198,7 +199,7 @@ class FA(PyroModule):
         optimizer = pyro.optim.Adam({"lr": 0.02})
         elbo = Trace_ELBO()
         #data_loader = torch.utils.data.DataLoader(self.Y, batch_size=self.batch_size, shuffle=True, generator=torch.Generator(device='cuda'), drop_last = True)
-        #guide = autoguide.AutoNormal(pyro.poutine.block(self.model, hide=['s1', "s2"]))
+        # guide = autoguide.AutoNormal(self.model)
         guide = autoguide.AutoGuideList(self.model).to(device)
         guide.append(autoguide.AutoNormal(pyro.poutine.block(self.model, hide=['s1', "s2", "s_shared"])))
         guide.append(autoguide.AutoDiscreteParallel(pyro.poutine.block(self.model, expose=["s1", "s2", "s_shared"])))
@@ -210,47 +211,46 @@ class FA(PyroModule):
             optim = optimizer,
             loss = elbo
         )
+
+        t0 = time.time()
         
-        num_iterations = 2000
+        num_epochs = 100
         train_loss = []
-        for j in range(num_iterations):
-        #for j in enumerate(self.train_dataloader):
-            # calculate the loss and take a gradient step
-            #batch_loss = []
-            #for batch in data_loader:
-            loss = svi.step()
-            #batch_loss.append(temp_loss)#.detach().cpu().numpy())
+        train_loss = []
+        for epoch_i in range(num_epochs):
+            indices = np.arange(self.num_samples)
+            np.random.shuffle(indices)
+            for batch_i in range(math.ceil(len(indices) / self.batch_size)):
+                subsample_ix = indices[batch_i * self.batch_size: (batch_i + 1) * self.batch_size]
+                # calculate the loss and take a gradient step (loss should be already scaled down by the pyro.places)
+                loss = svi.step(subsample_ix)
 
+                train_loss.append(loss/self.num_samples)
+            print("[%02d:%02.1d iteration %02d:%05d] loss: %.4f" % (
+                round((time.time() - t0)/60),
+                round(time.time() - t0, ndigits=1) % 60,
+                epoch_i+1,
+                ((epoch_i+1)*math.ceil(len(indices) / self.batch_size)),
+                loss / self.num_samples))
 
-            train_loss.append(loss / self.Y1.shape[0])
-            #    test_loss.append(elbo.loss(self.model, guide, test_data))
-
-            print("[iteration %04d] loss: %.4f" % (j + 1,  loss / self.Y1.shape[0]))
+        torch.save({"model": self.state_dict(), "guide" : guide}, model_dir+f"{modelname}.pt")
+        pyro.get_param_store().save(model_dir+f"{modelname}_params.pt")
             
-            #with torch.no_grad():  # for logging only
-                #train_loss = elbo.loss(self.model, guide, self.train_data) # or average over batch_loss
-                #test_loss = elbo.loss(self.model, guide, self.test_data)
-            #print(train_loss, test_loss)
-        torch.save({"model": self.state_dict(), "guide" : guide}, f"/mnt/storage/anna/{modelname}.pt")
-        pyro.get_param_store().save(f"/mnt/storage/anna/{modelname}_params.pt")
-
-            # Obtain maximum a posteriori estimates for W and Z
-        #map_estimates = guide()
-            
-        return train_loss#, map_estimates
+        return train_loss
 
 if __name__ == "__main__":
-    Cite_GEX = sc.read_h5ad("/mnt/storage/anna/data/Cite_GEX_downsampled.h5ad")
-    Cite_ADT = sc.read_h5ad("/mnt/storage/anna/data/Cite_ADT_downsampled.h5ad")
+    Cite_GEX = sc.read_h5ad(data_dir+"Cite_GEX_preprocessed.h5ad")
+    Cite_ADT = sc.read_h5ad(data_dir+"Cite_ADT_preprocessed.h5ad")
 
-    Cite_GEX.var_names = [name[:-2] if "-1" in name else name for name in Cite_GEX.var_names] ## make var names not unique to find 
+    Cite_GEX.var_names = [name[:-2] if "-1" in name else name for name in Cite_GEX.var_names] ## make var names not unique to find
+    print(f"matrix density Y_GEX={np.sum(Cite_GEX.X != 0) / np.product(Cite_GEX.X.shape)} Y_ADT={np.sum(Cite_ADT.X != 0) / np.product(Cite_ADT.X.shape)}")
 
     Y = ad.concat([Cite_ADT, Cite_GEX], axis = 1, merge="same")
     #Y = torch.tensor(Y.X.A).to(device)
     n_factors = 10
-    FA_model = FA(Y,134, 2732, n_factors)
+    FA_model = FA(Y,Cite_ADT.shape[1], Cite_GEX.shape[1], n_factors)
     losses = FA_model.train()
-    pd.DataFrame(losses).to_csv(f"/mnt/storage/anna/{modelname}.csv")
+    pd.DataFrame(losses).to_csv(model_dir+f"{modelname}.csv")
 
     #FA_model = FA(Y,20, 30, n_factors)
     #losses, estimates = FA_model.train()
@@ -274,8 +274,8 @@ if __name__ == "__main__":
 
 
     #load data
-    #Cite_GEX = sc.read_h5ad("/mnt/storage/anna/data/Cite_GEX_preprocessed.h5ad")
-    #Cite_ADT = sc.read_h5ad("/mnt/storage/anna/data/Cite_ADT_preprocessed.h5ad")
+    #Cite_GEX = sc.read_h5ad(data_dir+"Cite_GEX_preprocessed.h5ad")
+    #Cite_ADT = sc.read_h5ad(data_dir+"data/Cite_ADT_preprocessed.h5ad")
 
     #Y = ad.concat([Cite_ADT, Cite_GEX], axis = 1, merge="same")
     #Y = torch.tensor(Y.X.A)
